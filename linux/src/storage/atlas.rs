@@ -1,4 +1,9 @@
+use super::{
+	protected::{ProtectedBytes, fresh_key},
+	secret::SecretMemory,
+};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use zeroize::Zeroizing;
 
 #[derive(Clone, Default)]
@@ -23,7 +28,7 @@ impl FieldAtlas {
 		FieldAtlas { fields }
 	}
 	pub fn serialize(&self) -> Zeroizing<Vec<u8>> {
-		let mut buffer = Vec::new();
+		let mut buffer = Vec::with_capacity(self.fields.values().map(|v| 5 + v.len()).sum());
 		for (&field_type, value) in &self.fields {
 			buffer.push(field_type);
 			let len = value.len() as u32;
@@ -39,50 +44,82 @@ impl FieldAtlas {
 		self.get(field_type)
 			.and_then(|bytes| std::str::from_utf8(bytes).ok())
 	}
+	pub fn take(&mut self, field_type: u8) -> Option<Zeroizing<Vec<u8>>> {
+		self.fields.remove(&field_type)
+	}
+
 	pub fn set(&mut self, field_type: u8, value: Vec<u8>) {
 		self.fields.insert(field_type, value.into());
 	}
 }
 
-#[derive(Default)]
 pub struct EntryAtlas {
-	pub entries: BTreeMap<u32, (u8, Zeroizing<Vec<u8>>)>,
+	pub entries: BTreeMap<u32, (u8, ProtectedBytes)>,
+	key: Arc<SecretMemory>,
+}
+
+impl Default for EntryAtlas {
+	fn default() -> Self {
+		Self {
+			entries: BTreeMap::new(),
+			key: fresh_key(),
+		}
+	}
 }
 
 impl EntryAtlas {
+	fn context(id: u32, tag: u8) -> [u8; 5] {
+		let mut context = [0; 5];
+		context[..4].copy_from_slice(&id.to_le_bytes());
+		context[4] = tag;
+		context
+	}
+
 	pub fn deserialize(data: &[u8]) -> Self {
-		let mut entries = BTreeMap::new();
-		let mut id = 0u32;
-		let mut cursor = 0usize;
+		let mut atlas = Self::default();
+		let mut cursor = 0;
+		let mut id = 0;
 		while cursor < data.len() {
-			let entry_type = data[cursor];
+			let tag = data[cursor];
 			cursor += 1;
 			let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
 			cursor += 4;
-			let value = Zeroizing::new(data[cursor..cursor + len].to_vec());
-			entries.insert(id, (entry_type, value));
-			id += 1;
+			atlas.set(id, tag, &data[cursor..cursor + len]);
 			cursor += len;
+			id += 1;
 		}
-		EntryAtlas { entries }
+		atlas
 	}
 
 	pub fn serialize(&self) -> Zeroizing<Vec<u8>> {
-		let mut buffer = Vec::new();
-		for (entry_type, value) in self.entries.values() {
-			buffer.push(*entry_type);
-			let len = value.len() as u32;
-			buffer.extend_from_slice(&len.to_le_bytes());
-			buffer.extend_from_slice(value.as_ref());
+		// Size from ciphertext lengths to avoid reallocating plaintext buffers.
+		let size = self
+			.entries
+			.values()
+			.map(|(_, value)| 5 + value.plaintext_len())
+			.sum();
+		let mut buffer = Zeroizing::new(Vec::with_capacity(size));
+		for id in self.entries.keys() {
+			let (tag, value) = self.get(*id).unwrap();
+			buffer.push(tag);
+			buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
+			buffer.extend_from_slice(&value);
 		}
-		Zeroizing::new(buffer)
+		buffer
 	}
 
-	pub fn set(&mut self, id: u32, entry_type: u8, value: Vec<u8>) {
-		self.entries.insert(id, (entry_type, Zeroizing::new(value)));
+	pub fn set(&mut self, id: u32, tag: u8, value: &[u8]) {
+		let sealed = ProtectedBytes::seal(&self.key, value, &Self::context(id, tag));
+		self.entries.insert(id, (tag, sealed));
 	}
 
 	pub fn get(&self, id: u32) -> Option<(u8, Zeroizing<Vec<u8>>)> {
-		self.entries.get(&id).cloned()
+		let (tag, sealed) = self.entries.get(&id)?;
+		Some((*tag, sealed.open(&Self::context(id, *tag))))
+	}
+
+	pub fn clear(&mut self) {
+		self.entries.clear();
+		self.key.zeroize().expect("Failed to erase memory key");
 	}
 }

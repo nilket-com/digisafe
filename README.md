@@ -6,7 +6,8 @@ A digital safe for secure storage of everything LastPass leaks and KeePass fails
 
  - 4GiB Argon2id / Sha3 salted and peppered master password derivation.
  - TPM locked pepper via systemd-creds.
- - Secret memory based master password storage.
+ - Secret memory based master key storage.
+ - Authenticated in-memory encryption of cached entries, passwords, PINs, and notes.
  - The entire app is unswappable and undumpable.
  - Dynamic linker hijacking blockage.
  - Tracing blockage. (ptrace, strace, ltrace, gdb)
@@ -49,6 +50,26 @@ and enter the original pepper seed used for the vault. This skips rebuilding,
 backs up the previous encrypted pepper, and validates the regenerated value
 before replacing it. It preserves Backblaze credentials. A different seed
 will not unlock an existing vault.
+
+### Secrets in memory
+
+Passwords, PINs, and notes stay encrypted while hidden, including in the selected
+entry. Reveal a field to view or edit it; hide it when finished. Notes also start
+hidden. Selecting another entry hides all secret fields again. Copying a password
+or PIN does not require revealing it.
+
+The memory layer uses XChaCha20-Poly1305 with random keys in `memfd_secret`, fresh
+nonces, and authenticated field/record identifiers. Secret mappings are exclusive
+and unmapped after use. Application-owned temporary plaintext buffers are wiped
+on disposal; the master password is moved into the unlock task instead of cloned.
+The on-disk vault format and Backblaze representation are unchanged: existing
+vaults open and save without conversion or additional dependencies.
+
+This reduces plaintext exposure while the application is idle. It does not
+protect against an attacker controlling the process. Revealing/editing secrets,
+copying them, and compressing a vault still involves Iced, clipboard, and LZ4
+buffers whose internal copies are not guaranteed to be wiped. Clipboard history
+and receiving applications can also retain copied secrets.
 
 ### Known Weaknesses
 

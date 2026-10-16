@@ -1,10 +1,14 @@
 use crate::storage::{
 	atlas::{EntryAtlas, FieldAtlas},
-	entry::{MetaEntry, PasswordEntry}, secret::SecretMemory,
+	entry::{MetaEntry, PasswordEntry},
+	secret::SecretMemory,
 };
-use std::{collections::BTreeMap, mem, sync::{Arc, RwLock}};
+use std::{
+	collections::BTreeMap,
+	mem,
+	sync::{Arc, RwLock},
+};
 use zeroize::{Zeroize, Zeroizing};
-
 
 #[derive(Debug)]
 #[repr(u8)]
@@ -20,6 +24,14 @@ pub struct Database {
 }
 
 impl Database {
+	#[cfg(test)]
+	#[allow(dead_code)] // The library target does not include GUI tests.
+	pub(crate) fn test_database() -> Self {
+		let key = SecretMemory::new_pages(1).unwrap();
+		key.write(0, &[42; 32]).unwrap();
+		Self::new(key)
+	}
+
 	pub fn new(master_key: SecretMemory) -> Self {
 		let idb = InteriorDatabase::default();
 		Self {
@@ -47,12 +59,10 @@ impl Database {
 			return Some(entry);
 		}
 		let tag_query = match query.split_once(".") {
-			Some((tag, tag_index_str)) => {
-				match tag_index_str.parse::<usize>().ok() {
-					Some(tag_index) => (tag, tag_index.saturating_sub(1)),
-					None => (query, 0),
-				}
-			}
+			Some((tag, tag_index_str)) => match tag_index_str.parse::<usize>().ok() {
+				Some(tag_index) => (tag, tag_index.saturating_sub(1)),
+				None => (query, 0),
+			},
 			_ => (query, 0),
 		};
 		self.get_password_entries_by_tag(tag_query.0)
@@ -76,10 +86,12 @@ impl Database {
 	pub fn meta_only(&self) -> Self {
 		let mut meta = EntryAtlas::default();
 		let mut idx = 1u32;
-		for (entry_tag, entry_data) in self.idb.read().unwrap().entries.entries.values() {
-			let entry_tag = unsafe { mem::transmute::<u8, EntryTag>(*entry_tag) };
+		let idb = self.idb.read().unwrap();
+		for id in idb.entries.entries.keys() {
+			let (entry_tag, entry_data) = idb.entries.get(*id).unwrap();
+			let entry_tag = unsafe { mem::transmute::<u8, EntryTag>(entry_tag) };
 			if let EntryTag::Meta = entry_tag {
-				meta.set(idx, entry_tag as u8, entry_data.to_vec());
+				meta.set(idx, entry_tag as u8, &entry_data);
 				idx += 1;
 			}
 		}
@@ -120,18 +132,22 @@ impl InteriorDatabase {
 					continue;
 				}
 				let index_by_tag_key = format!("tag\x00{}", tag);
-				self.index_by_tag.entry(index_by_tag_key).or_default().push(id);
+				self.index_by_tag
+					.entry(index_by_tag_key)
+					.or_default()
+					.push(id);
 			}
 		} else {
 			id = *self.index_by_name.get(&index_by_name_key).unwrap();
 		}
 		self.entries
-			.set(id, EntryTag::Password as u8, entry.serialize().to_vec());
+			.set(id, EntryTag::Password as u8, &entry.serialize());
 	}
 	fn get_password_entry_by_name(&self, name: &str) -> Option<PasswordEntry> {
 		let index_by_name_key = format!("password\x00{}", name);
 		if let Some(id) = self.index_by_name.get(&index_by_name_key)
-			&& let Some(entry) = self.entries.get(*id) {
+			&& let Some(entry) = self.entries.get(*id)
+		{
 			return Some(PasswordEntry::from(FieldAtlas::deserialize(&entry.1)));
 		}
 		None
@@ -151,7 +167,11 @@ impl InteriorDatabase {
 	fn previous(&self, name: &str) -> Option<PasswordEntry> {
 		let lower_bound = "password\x00".to_string();
 		let index_by_name_key = format!("{lower_bound}{name}");
-		let previous_id = self.index_by_name.range(lower_bound..index_by_name_key).next_back().map(|kv| kv.1)?;
+		let previous_id = self
+			.index_by_name
+			.range(lower_bound..index_by_name_key)
+			.next_back()
+			.map(|kv| kv.1)?;
 		let (entry_tag, entry_data) = self.entries.get(*previous_id)?;
 		let entry_tag = unsafe { mem::transmute::<u8, EntryTag>(entry_tag) };
 		match entry_tag {
@@ -163,8 +183,16 @@ impl InteriorDatabase {
 		let lower_bound = "password\x00".to_string();
 		let upper_bound = "password\x01".to_string();
 		let index_by_name_key = format!("{lower_bound}{name}");
-		let offset = if self.index_by_name.contains_key(&index_by_name_key) { 1 } else { 0 };
-		let next_id = self.index_by_name.range(index_by_name_key..upper_bound).nth(offset).map(|kv| kv.1)?;
+		let offset = if self.index_by_name.contains_key(&index_by_name_key) {
+			1
+		} else {
+			0
+		};
+		let next_id = self
+			.index_by_name
+			.range(index_by_name_key..upper_bound)
+			.nth(offset)
+			.map(|kv| kv.1)?;
 		let (entry_tag, entry_data) = self.entries.get(*next_id)?;
 		let entry_tag = unsafe { mem::transmute::<u8, EntryTag>(entry_tag) };
 		match entry_tag {
@@ -185,12 +213,13 @@ impl InteriorDatabase {
 			id = *self.index_by_name.get(&index_by_name_key).unwrap();
 		}
 		self.entries
-			.set(id, EntryTag::Meta as u8, entry.serialize().to_vec());
+			.set(id, EntryTag::Meta as u8, &entry.serialize());
 	}
 	pub fn get_meta_entry(&self, name: &str) -> Option<MetaEntry> {
 		let index_by_name_key = format!("meta\x00{}", name);
 		if let Some(id) = self.index_by_name.get(&index_by_name_key)
-			&& let Some(entry) = self.entries.get(*id) {
+			&& let Some(entry) = self.entries.get(*id)
+		{
 			return Some(MetaEntry::from(FieldAtlas::deserialize(&entry.1)));
 		}
 		None
@@ -204,9 +233,10 @@ impl InteriorDatabase {
 	}
 	pub fn from_entry_atlas(entry_atlas: EntryAtlas) -> Self {
 		let mut db = InteriorDatabase::default();
-		for (entry_tag, entry_data) in entry_atlas.entries.values() {
-			let entry = FieldAtlas::deserialize(entry_data);
-			let entry_tag = unsafe { mem::transmute::<u8, EntryTag>(*entry_tag) };
+		for id in entry_atlas.entries.keys() {
+			let (entry_tag, entry_data) = entry_atlas.get(*id).unwrap();
+			let entry = FieldAtlas::deserialize(&entry_data);
+			let entry_tag = unsafe { mem::transmute::<u8, EntryTag>(entry_tag) };
 			match entry_tag {
 				EntryTag::Meta => {
 					db.set_meta_entry(MetaEntry::from(entry));
@@ -219,9 +249,7 @@ impl InteriorDatabase {
 		db
 	}
 	pub fn zeroize(&mut self) {
-		for (_, value) in self.entries.entries.values_mut() {
-			value.zeroize();
-		}
+		self.entries.clear();
 		let index_by_name = mem::take(&mut self.index_by_name);
 		for (mut key, _) in index_by_name {
 			key.zeroize();
@@ -230,5 +258,65 @@ impl InteriorDatabase {
 		for (mut key, _) in index_by_tag {
 			key.zeroize();
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn original_format_fixture() -> Vec<u8> {
+		// The existing on-disk TLV representation, without the new memory layer.
+		let mut fields = Vec::new();
+		for (id, text) in [
+			(1u8, "example"),
+			(2, "alice"),
+			(3, "password 🔑"),
+			(4, "1234"),
+			(5, "private note"),
+			(7, "test"),
+		] {
+			fields.push(id);
+			fields.extend_from_slice(&(text.len() as u32).to_le_bytes());
+			fields.extend_from_slice(text.as_bytes());
+		}
+		let mut bytes = vec![1];
+		bytes.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+		bytes.extend_from_slice(&fields);
+		bytes
+	}
+
+	#[test]
+	fn existing_format_roundtrips_and_edits_without_migration() {
+		let fixture = original_format_fixture();
+		let mut db = InteriorDatabase::deserialize(&fixture);
+		assert_eq!(&*db.serialize(), &fixture);
+		let mut entry = db.get_password_entry_by_name("example").unwrap();
+		assert_eq!(entry.get_password().as_str(), "password 🔑");
+		assert_eq!(entry.get_pin().as_str(), "1234");
+		assert_eq!(entry.get_note().as_str(), "private note");
+		assert_eq!(db.get_password_entries_by_tag("test").unwrap().len(), 1);
+		entry.set_password("replacement");
+		db.set_password_entry(entry);
+		let reloaded = InteriorDatabase::deserialize(&db.serialize());
+		assert_eq!(
+			reloaded
+				.get_password_entry_by_name("example")
+				.unwrap()
+				.get_password()
+				.as_str(),
+			"replacement"
+		);
+		assert_eq!(
+			reloaded
+				.get_password_entry_by_name("example")
+				.unwrap()
+				.get_note()
+				.as_str(),
+			"private note"
+		);
+		db.zeroize();
+		assert!(db.entries.entries.is_empty());
+		assert!(db.index_by_name.is_empty());
 	}
 }

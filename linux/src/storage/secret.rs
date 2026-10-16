@@ -1,198 +1,162 @@
 use libc::{
-	c_void, ftruncate, madvise, mmap, munmap, off_t, syscall, sysconf, SYS_memfd_secret,
-	MADV_DONTDUMP, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, _SC_PAGESIZE,
+	_SC_PAGESIZE, MAP_FAILED, MAP_SHARED, O_CLOEXEC, PROT_READ, PROT_WRITE, SYS_memfd_secret,
+	ftruncate, mmap, munmap, off_t, syscall, sysconf,
 };
 use std::{
-	fmt, io,
+	io,
 	ops::{Deref, DerefMut},
-	os::unix::io::{AsRawFd, FromRawFd, OwnedFd},
+	os::fd::{AsRawFd, FromRawFd, OwnedFd},
 	ptr, slice,
 	sync::{
-		atomic::{compiler_fence, AtomicUsize, Ordering},
-		OnceLock,
+		Mutex, MutexGuard,
+		atomic::{AtomicUsize, Ordering},
 	},
 };
+use zeroize::Zeroize;
 
-static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
-
-fn get_page_size() -> usize {
-	*PAGE_SIZE.get_or_init(|| {
-		let res = unsafe { sysconf(_SC_PAGESIZE) };
-		if res < 0 {
-			4096
-		} else {
-			res as usize
-		}
-	})
-}
-
+/// A secret file is unmapped between operations. The mutex prevents aliases to
+/// writable mappings, including when callers share this object through Arc.
 pub struct SecretMemory {
-	secret_fd: OwnedFd,
+	fd: OwnedFd,
 	capacity: usize,
 	length: AtomicUsize,
+	mapping: Mutex<()>,
 }
 
 impl SecretMemory {
-	pub fn new(capacity: usize) -> Result<Self, io::Error> {
-		let fd = unsafe { syscall(SYS_memfd_secret, 0) as i32 };
+	pub fn new(capacity: usize) -> io::Result<Self> {
+		if capacity == 0 || capacity > off_t::MAX as usize {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"Invalid secret capacity",
+			));
+		}
+		let fd = unsafe { syscall(SYS_memfd_secret, O_CLOEXEC) as i32 };
 		if fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
-		let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-		if unsafe { ftruncate(owned_fd.as_raw_fd(), capacity as off_t) } < 0 {
+		let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+		if unsafe { ftruncate(fd.as_raw_fd(), capacity as off_t) } < 0 {
 			return Err(io::Error::last_os_error());
 		}
 		Ok(Self {
-			secret_fd: owned_fd,
+			fd,
 			capacity,
 			length: AtomicUsize::new(0),
+			mapping: Mutex::new(()),
 		})
 	}
 
-	pub fn new_pages(num_pages: usize) -> Result<Self, io::Error> {
-		Self::new(num_pages * get_page_size())
+	pub fn new_pages(pages: usize) -> io::Result<Self> {
+		let size = unsafe { sysconf(_SC_PAGESIZE) };
+		if size <= 0 {
+			return Err(io::Error::last_os_error());
+		}
+		let capacity = pages
+			.checked_mul(size as usize)
+			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Capacity overflow"))?;
+		Self::new(capacity)
 	}
 
-	pub fn view(&self) -> Result<MappedGuard<'_>, io::Error> {
-		let mapped_ptr = unsafe {
+	fn map(&self, full: bool) -> io::Result<MappedGuard<'_>> {
+		let lock = self.mapping.lock().unwrap_or_else(|e| e.into_inner());
+		let ptr = unsafe {
 			mmap(
 				ptr::null_mut(),
 				self.capacity,
 				PROT_READ | PROT_WRITE,
 				MAP_SHARED,
-				self.secret_fd.as_raw_fd(),
+				self.fd.as_raw_fd(),
 				0,
 			)
 		};
-		if mapped_ptr == MAP_FAILED {
+		if ptr == MAP_FAILED {
 			return Err(io::Error::last_os_error());
 		}
-		unsafe {
-			madvise(mapped_ptr, self.capacity, MADV_DONTDUMP);
-		}
 		Ok(MappedGuard {
-			mapped_ptr,
-			capacity: self.capacity,
-			length: &self.length,
+			ptr: ptr.cast(),
+			mapped_len: self.capacity,
+			visible_len: if full {
+				self.capacity
+			} else {
+				self.length.load(Ordering::Acquire)
+			},
+			_lock: lock,
 		})
 	}
 
-	pub fn write(&self, offset: usize, data: &[u8]) -> Result<(), io::Error> {
-		let mut guard = self.view()?;
+	pub fn write(&self, offset: usize, data: &[u8]) -> io::Result<()> {
 		let end = offset
 			.checked_add(data.len())
-			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Overflow"))?;
-		if end > self.capacity {
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"Buffer overflow",
-			));
-		}
+			.filter(|end| *end <= self.capacity)
+			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Buffer overflow"))?;
+		let mut guard = self.map(true)?;
 		guard[offset..end].copy_from_slice(data);
 		self.length.fetch_max(end, Ordering::Release);
 		Ok(())
 	}
 
-	pub fn read(&self) -> Result<MappedGuard<'_>, io::Error> {
-		let mapped_ptr = unsafe {
-			mmap(
-				ptr::null_mut(),
-				self.capacity,
-				PROT_READ | PROT_WRITE,
-				MAP_SHARED,
-				self.secret_fd.as_raw_fd(),
-				0,
-			)
-		};
-		if mapped_ptr == MAP_FAILED {
-			return Err(io::Error::last_os_error());
-		}
-		unsafe {
-			madvise(mapped_ptr, self.capacity, MADV_DONTDUMP);
-		}
-		Ok(MappedGuard {
-			mapped_ptr,
-			capacity: self.len(),
-			length: &self.length,
-		})
+	pub fn read(&self) -> io::Result<MappedGuard<'_>> {
+		self.map(false)
 	}
 
-	pub fn len(&self) -> usize {
-		self.length.load(Ordering::Acquire)
-	}
-
-	#[allow(dead_code)]
-	pub fn is_empty(&self) -> bool {
-		self.len() == 0
-	}
-
-	pub fn zeroize(&self) -> Result<(), io::Error> {
-		let mut guard = self.view()?;
-		for byte in guard.iter_mut() {
-			unsafe { ptr::write_volatile(byte, 0) };
-		}
-		compiler_fence(Ordering::SeqCst);
+	pub fn zeroize(&self) -> io::Result<()> {
+		let mut guard = self.map(true)?;
+		guard.zeroize();
 		self.length.store(0, Ordering::Release);
 		Ok(())
 	}
 }
 
+impl Drop for SecretMemory {
+	fn drop(&mut self) {
+		// Closing the final fd also releases the secret pages if mapping fails.
+		let _ = self.zeroize();
+	}
+}
+
 pub struct MappedGuard<'a> {
-	mapped_ptr: *mut c_void,
-	capacity: usize,
-	length: &'a AtomicUsize,
+	ptr: *mut u8,
+	mapped_len: usize,
+	visible_len: usize,
+	_lock: MutexGuard<'a, ()>,
 }
-
-impl<'a> MappedGuard<'a> {
-	pub fn len(&self) -> usize {
-		self.length.load(Ordering::Acquire)
-	}
-
-	#[allow(dead_code)]
-	pub fn is_empty(&self) -> bool {
-		self.len() == 0
-	}
-}
-
-impl<'a> Deref for MappedGuard<'a> {
+impl Deref for MappedGuard<'_> {
 	type Target = [u8];
-	fn deref(&self) -> &Self::Target {
-		unsafe { slice::from_raw_parts(self.mapped_ptr as *const u8, self.capacity) }
+	fn deref(&self) -> &[u8] {
+		unsafe { slice::from_raw_parts(self.ptr, self.visible_len) }
 	}
 }
-
-impl<'a> DerefMut for MappedGuard<'a> {
+impl DerefMut for MappedGuard<'_> {
 	fn deref_mut(&mut self) -> &mut [u8] {
-		unsafe { slice::from_raw_parts_mut(self.mapped_ptr as *mut u8, self.capacity) }
+		unsafe { slice::from_raw_parts_mut(self.ptr, self.visible_len) }
 	}
 }
-
-impl<'a> Drop for MappedGuard<'a> {
+impl Drop for MappedGuard<'_> {
 	fn drop(&mut self) {
 		unsafe {
-			munmap(self.mapped_ptr, self.capacity);
+			munmap(self.ptr.cast(), self.mapped_len);
 		}
 	}
 }
 
-impl<'a> fmt::Debug for MappedGuard<'a> {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter
-			.debug_struct("MappedGuard")
-			.field("capacity", &self.capacity)
-			.field("length", &self.len())
-			.field("data", &"*** REDACTED ***")
-			.finish()
-	}
-}
+#[cfg(test)]
+mod tests {
+	use super::*;
 
-impl<'a> fmt::Display for MappedGuard<'a> {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(
-			formatter,
-			"SecretMemoryView(unaddressable, {}/{} bytes)",
-			self.len(),
-			self.capacity,
-		)
+	#[test]
+	fn mappings_are_exclusive_and_keep_the_full_unmap_length() {
+		let secret = SecretMemory::new_pages(2).unwrap();
+		secret.write(0, b"secret").unwrap();
+		let guard = secret.read().unwrap();
+		assert_eq!(&*guard, b"secret");
+		assert_eq!(guard.mapped_len, secret.capacity);
+		assert!(secret.mapping.try_lock().is_err());
+		drop(guard);
+		assert!(secret.mapping.try_lock().is_ok());
+		secret.zeroize().unwrap();
+		assert!(secret.read().unwrap().is_empty());
+		assert!(secret.map(true).unwrap().iter().all(|b| *b == 0));
+		assert!(secret.write(usize::MAX, b"x").is_err());
 	}
 }

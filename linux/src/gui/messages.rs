@@ -1,15 +1,17 @@
 use crate::storage::database::Database;
 use iced::widget::text_editor;
+use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub enum Message {
 	AttemptUnlock,
 	ClearClipboard,
 	CloseWindow,
+	CopyUsername,
 	CopyPassword,
 	CopyPin,
 	DbNameChanged(String),
-	DbPasswordChanged(String),
+	DbPasswordChanged(Zeroizing<String>),
 	DragWindow,
 	FocusNext,
 	FocusPrevious,
@@ -20,8 +22,8 @@ pub enum Message {
 	PasswordEntryGet,
 	PasswordEntryNameInput(String),
 	PasswordEntryNoteAction(text_editor::Action),
-	PasswordEntryPasswordInput(String),
-	PasswordEntryPinInput(String),
+	PasswordEntryPasswordInput(Zeroizing<String>),
+	PasswordEntryPinInput(Zeroizing<String>),
 	PasswordEntrySet,
 	PasswordEntryTagsInput(String),
 	PasswordEntryUrlInput(String),
@@ -33,5 +35,6 @@ pub enum Message {
 	Tick,
 	TogglePasswordVisibility,
 	TogglePinVisibility,
+	ToggleNoteVisibility,
 	UnlockResult(Database),
 }

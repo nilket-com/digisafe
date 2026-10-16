@@ -48,7 +48,7 @@ fn backblaze_path() -> String {
 	apath.to_str().unwrap().to_string()
 }
 
-pub async fn load(db_name: &str, master_password: String) -> Database {
+pub async fn load(db_name: &str, master_password: Zeroizing<String>) -> Database {
 	let path = db_path(db_name);
 	let db_remote_bin_opt = download_db(db_name).await;
 	match db_remote_bin_opt {
@@ -95,7 +95,7 @@ pub async fn load(db_name: &str, master_password: String) -> Database {
 	}
 }
 
-fn new_db(db_name: &str, master_password: String) -> Database {
+fn new_db(db_name: &str, master_password: Zeroizing<String>) -> Database {
 	let created_ts = SystemTime::now()
 		.duration_since(SystemTime::UNIX_EPOCH)
 		.unwrap()
@@ -152,7 +152,7 @@ fn db_from_envelope(
 	Database::old(master_key, db_core)
 }
 
-fn db_from_vec(encoded: Vec<u8>, master_password: String) -> Database {
+fn db_from_vec(encoded: Vec<u8>, master_password: Zeroizing<String>) -> Database {
 	let db_envelope = db_envelope_from_vec(encoded);
 	let (nonce, salt) = parse_decryption_parameters(&db_envelope);
 	let master_key = master_key_derivation(master_password, salt);
@@ -189,9 +189,9 @@ fn db_to_vec(db: &Database) -> Vec<u8> {
 	nonce[..16].copy_from_slice(&num_nonce.to_le_bytes());
 	db.set_meta_entry(MetaEntry::new("nonce", &num_nonce.to_string()));
 	let db_core = db.serialize();
-	let db_core_compressed = compress(db_core.to_vec());
+	let db_core_compressed = compress(&db_core);
 	let db_core_encrypted = encrypt(
-		db_core_compressed,
+		&db_core_compressed,
 		&db.clone_master_key().read().unwrap(),
 		nonce,
 	);
@@ -216,10 +216,9 @@ fn load_pepper() -> [u8; PEPPER_SIZE] {
 	pepper
 }
 
-fn master_key_derivation(password: String, salt: [u8; SALT_SIZE]) -> SecretMemory {
+fn master_key_derivation(password: Zeroizing<String>, salt: [u8; SALT_SIZE]) -> SecretMemory {
 	use argon2::{Algorithm, Argon2, ParamsBuilder, Version};
 	use sha3::{Digest, Sha3_256};
-	let password = Zeroizing::new(password);
 	let pepper = load_pepper();
 	let mut pre_hasher = Sha3_256::new();
 	pre_hasher.update(salt);
@@ -240,12 +239,11 @@ fn master_key_derivation(password: String, salt: [u8; SALT_SIZE]) -> SecretMemor
 		.unwrap();
 	let main_hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, main_params);
 	let mut main_hash = [0u8; KEY_SIZE];
+	let mut derivation_salt = Zeroizing::new([0u8; SALT_SIZE + PEPPER_SIZE]);
+	derivation_salt[..SALT_SIZE].copy_from_slice(&salt);
+	derivation_salt[SALT_SIZE..].copy_from_slice(&pepper);
 	main_hasher
-		.hash_password_into(
-			&pre_hash,
-			&[&salt as &[u8], &pepper as &[u8]].concat(),
-			&mut main_hash,
-		)
+		.hash_password_into(&pre_hash, &*derivation_salt, &mut main_hash)
 		.unwrap();
 	let mut post_hasher = Sha3_256::new();
 	post_hasher.update(main_hash);
@@ -272,43 +270,90 @@ fn from_base64(msg_enc: &str) -> Vec<u8> {
 	Base64::decode_vec(msg_enc).unwrap()
 }
 
-fn compress(msg: Vec<u8>) -> Vec<u8> {
-	use lz4::EncoderBuilder;
-	let mut encoder = EncoderBuilder::new().level(9).build(vec![]).unwrap();
-	let _ = encoder.write(&msg[..]);
-	encoder.finish().0
-}
-
-fn decompress(msg_enc: Vec<u8>) -> Vec<u8> {
-	use lz4::Decoder;
-	let mut msg = vec![];
-	{
-		let mut decoder = Decoder::new(&msg_enc[..]).unwrap();
-		let _ = std::io::copy(&mut decoder, &mut msg);
+// Grow by copying into a new wiping allocation, so a realloc never abandons
+// plaintext in the allocator's old buffer.
+#[derive(Default)]
+struct WipingWriter(Zeroizing<Vec<u8>>);
+impl Write for WipingWriter {
+	fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+		let required = self
+			.0
+			.len()
+			.checked_add(bytes.len())
+			.ok_or_else(|| std::io::Error::other("Plaintext size overflow"))?;
+		if required > self.0.capacity() {
+			let capacity = required.max(self.0.capacity().saturating_mul(2));
+			let mut next = Zeroizing::new(Vec::with_capacity(capacity));
+			next.extend_from_slice(&self.0);
+			self.0 = next;
+		}
+		self.0.extend_from_slice(bytes);
+		Ok(bytes.len())
 	}
-	msg
+	fn flush(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
 }
 
-fn encrypt(msg: Vec<u8>, key: &SecretMemory, nonce: [u8; NONCE_SIZE]) -> Vec<u8> {
-	use chacha20poly1305::{
-		aead::{Aead, KeyInit},
-		XChaCha20Poly1305,
-	};
-	let mut key: [u8; 32] = key.read().unwrap().to_vec().try_into().unwrap();
-	let cipher = XChaCha20Poly1305::new(&key.into());
-	key.zeroize();
-	cipher.encrypt(&nonce.into(), &msg[..]).unwrap()
+fn compress(msg: &[u8]) -> Zeroizing<Vec<u8>> {
+	let mut encoder = lz4::EncoderBuilder::new()
+		.level(9)
+		.build(WipingWriter::default())
+		.unwrap();
+	encoder.write_all(msg).unwrap();
+	let (writer, result) = encoder.finish();
+	result.unwrap();
+	writer.0
 }
 
-fn decrypt(msg_enc: Vec<u8>, key: &SecretMemory, nonce: [u8; NONCE_SIZE]) -> Option<Vec<u8>> {
+fn decompress(msg_enc: Zeroizing<Vec<u8>>) -> Zeroizing<Vec<u8>> {
+	let mut writer = WipingWriter::default();
+	let mut decoder = lz4::Decoder::new(&msg_enc[..]).unwrap();
+	// std::io::copy's ordinary scratch buffer would retain plaintext.
+	let mut scratch = Zeroizing::new([0u8; 8192]);
+	loop {
+		let size = std::io::Read::read(&mut decoder, &mut *scratch).unwrap();
+		if size == 0 {
+			break;
+		}
+		writer.write_all(&scratch[..size]).unwrap();
+	}
+	writer.0
+}
+
+fn encrypt(msg: &[u8], key: &SecretMemory, nonce: [u8; NONCE_SIZE]) -> Vec<u8> {
 	use chacha20poly1305::{
-		aead::{Aead, KeyInit},
 		XChaCha20Poly1305,
+		aead::{AeadInPlace, KeyInit},
 	};
-	let mut key: [u8; 32] = key.read().unwrap().to_vec().try_into().unwrap();
-	let cipher = XChaCha20Poly1305::new(&key.into());
-	key.zeroize();
-	cipher.decrypt(&nonce.into(), msg_enc.as_ref()).ok()
+	let mapped = key.read().unwrap();
+	let cipher = XChaCha20Poly1305::new_from_slice(&mapped).unwrap();
+	drop(mapped);
+	let mut buffer = Zeroizing::new(Vec::with_capacity(msg.len() + 16));
+	buffer.extend_from_slice(msg);
+	cipher
+		.encrypt_in_place((&nonce).into(), b"", &mut *buffer)
+		.unwrap();
+	mem::take(&mut *buffer)
+}
+
+fn decrypt(
+	msg_enc: Vec<u8>,
+	key: &SecretMemory,
+	nonce: [u8; NONCE_SIZE],
+) -> Option<Zeroizing<Vec<u8>>> {
+	use chacha20poly1305::{
+		XChaCha20Poly1305,
+		aead::{AeadInPlace, KeyInit},
+	};
+	let mapped = key.read().unwrap();
+	let cipher = XChaCha20Poly1305::new_from_slice(&mapped).unwrap();
+	drop(mapped);
+	let mut buffer = Zeroizing::new(msg_enc);
+	cipher
+		.decrypt_in_place((&nonce).into(), b"", &mut *buffer)
+		.ok()?;
+	Some(buffer)
 }
 
 const ERASURE_DATA_SHARDS: usize = 8;
@@ -502,5 +547,39 @@ async fn download_db(db_name: &str) -> Option<Vec<u8>> {
 		Some(from_base64(&download_resp.text().await.unwrap()))
 	} else {
 		None
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn existing_compression_and_cipher_format_are_preserved() {
+		use chacha20poly1305::{
+			XChaCha20Poly1305,
+			aead::{Aead, KeyInit},
+		};
+		let plaintext = b"synthetic vault record\n".repeat(10000);
+		let mut old_encoder = lz4::EncoderBuilder::new()
+			.level(9)
+			.build(Vec::new())
+			.unwrap();
+		old_encoder.write_all(&plaintext).unwrap();
+		let original_compressed = old_encoder.finish().0;
+		let compressed = compress(&plaintext);
+		assert_eq!(&*compressed, &original_compressed);
+		let key = SecretMemory::new_pages(1).unwrap();
+		key.write(0, &[42; 32]).unwrap();
+		let nonce = [7; NONCE_SIZE];
+		let cipher = XChaCha20Poly1305::new_from_slice(&[42; 32]).unwrap();
+		let original_encrypted = cipher
+			.encrypt((&nonce).into(), &original_compressed[..])
+			.unwrap();
+		assert_eq!(encrypt(&compressed, &key, nonce), original_encrypted);
+		let decoded = decompress(decrypt(original_encrypted.clone(), &key, nonce).unwrap());
+		assert_eq!(&*decoded, &plaintext);
+		let mut damaged = original_encrypted;
+		damaged[0] ^= 1;
+		assert!(decrypt(damaged, &key, nonce).is_none());
 	}
 }

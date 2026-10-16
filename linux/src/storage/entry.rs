@@ -1,5 +1,10 @@
+use super::{
+	protected::{ProtectedBytes, fresh_key},
+	secret::SecretMemory,
+};
 use crate::storage::atlas::FieldAtlas;
 use std::time::SystemTime;
+use std::{collections::BTreeMap, sync::Arc};
 use zeroize::Zeroizing;
 
 #[derive(Debug)]
@@ -63,11 +68,29 @@ pub enum PasswordField {
 #[derive(Clone)]
 pub struct PasswordEntry {
 	field_atlas: FieldAtlas,
+	secrets: BTreeMap<u8, ProtectedBytes>,
+	key: Arc<SecretMemory>,
 }
 
 impl From<FieldAtlas> for PasswordEntry {
-	fn from(field_atlas: FieldAtlas) -> Self {
-		PasswordEntry { field_atlas }
+	fn from(mut field_atlas: FieldAtlas) -> Self {
+		let key = fresh_key();
+		let mut secrets = BTreeMap::new();
+		for field in [
+			PasswordField::Password,
+			PasswordField::Pin,
+			PasswordField::Note,
+		] {
+			let id = field as u8;
+			if let Some(value) = field_atlas.take(id) {
+				secrets.insert(id, ProtectedBytes::seal(&key, &value, &[id]));
+			}
+		}
+		Self {
+			field_atlas,
+			secrets,
+			key,
+		}
 	}
 }
 
@@ -89,7 +112,7 @@ impl PasswordEntry {
 		let mut field_atlas = FieldAtlas::default();
 		field_atlas.set(PasswordField::CreatedTimestamp as u8, now.clone());
 		field_atlas.set(PasswordField::ModifiedTimestamp as u8, now);
-		PasswordEntry { field_atlas }
+		PasswordEntry::from(field_atlas)
 	}
 	pub fn set_name(&mut self, name: &str) {
 		self.update_ts();
@@ -103,13 +126,17 @@ impl PasswordEntry {
 	}
 	pub fn set_password(&mut self, password: &str) {
 		self.update_ts();
-		self.field_atlas
-			.set(PasswordField::Password as u8, password.as_bytes().to_vec());
+		let id = PasswordField::Password as u8;
+		self.secrets.insert(
+			id,
+			ProtectedBytes::seal(&self.key, password.as_bytes(), &[id]),
+		);
 	}
 	pub fn set_pin(&mut self, pin: &str) {
 		self.update_ts();
-		self.field_atlas
-			.set(PasswordField::Pin as u8, pin.as_bytes().to_vec());
+		let id = PasswordField::Pin as u8;
+		self.secrets
+			.insert(id, ProtectedBytes::seal(&self.key, pin.as_bytes(), &[id]));
 	}
 	pub fn set_url(&mut self, url: &str) {
 		self.update_ts();
@@ -123,8 +150,9 @@ impl PasswordEntry {
 	}
 	pub fn set_note(&mut self, note: &str) {
 		self.update_ts();
-		self.field_atlas
-			.set(PasswordField::Note as u8, note.as_bytes().to_vec());
+		let id = PasswordField::Note as u8;
+		self.secrets
+			.insert(id, ProtectedBytes::seal(&self.key, note.as_bytes(), &[id]));
 	}
 	fn update_ts(&mut self) {
 		let now = SystemTime::now()
@@ -147,15 +175,11 @@ impl PasswordEntry {
 			.get_str(PasswordField::Username as u8)
 			.unwrap_or_default()
 	}
-	pub fn get_password(&self) -> &str {
-		self.field_atlas
-			.get_str(PasswordField::Password as u8)
-			.unwrap_or_default()
+	pub fn get_password(&self) -> Zeroizing<String> {
+		self.open_secret(PasswordField::Password as u8)
 	}
-	pub fn get_pin(&self) -> &str {
-		self.field_atlas
-			.get_str(PasswordField::Pin as u8)
-			.unwrap_or_default()
+	pub fn get_pin(&self) -> Zeroizing<String> {
+		self.open_secret(PasswordField::Pin as u8)
 	}
 	pub fn get_url(&self) -> &str {
 		self.field_atlas
@@ -167,10 +191,8 @@ impl PasswordEntry {
 			.get_str(PasswordField::Tags as u8)
 			.unwrap_or_default()
 	}
-	pub fn get_note(&self) -> &str {
-		self.field_atlas
-			.get_str(PasswordField::Note as u8)
-			.unwrap_or_default()
+	pub fn get_note(&self) -> Zeroizing<String> {
+		self.open_secret(PasswordField::Note as u8)
 	}
 	pub fn get_timestamps(&self) -> String {
 		use chrono::{DateTime, Local, TimeZone, Utc};
@@ -199,7 +221,43 @@ impl PasswordEntry {
 		let cdt = cdt_local.format("%Y-%m-%d %H:%M");
 		format!("Modified: {mdt} | Created: {cdt} ")
 	}
+	fn open_secret(&self, id: u8) -> Zeroizing<String> {
+		let Some(value) = self.secrets.get(&id) else {
+			return Zeroizing::new(String::new());
+		};
+		let mut bytes = value.open(&[id]);
+		// Validate before transferring ownership to the wiping String.
+		std::str::from_utf8(&bytes).expect("Invalid secret text");
+		Zeroizing::new(String::from_utf8(std::mem::take(&mut *bytes)).unwrap())
+	}
+
 	pub fn serialize(&self) -> Zeroizing<Vec<u8>> {
-		self.field_atlas.serialize()
+		let mut fields = self.field_atlas.clone();
+		for (id, value) in &self.secrets {
+			let mut plaintext = value.open(&[*id]);
+			fields.set(*id, std::mem::take(&mut *plaintext));
+		}
+		fields.serialize()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn secret_fields_are_absent_from_plaintext_atlas() {
+		let mut entry = PasswordEntry::new();
+		entry.set_password("secret");
+		entry.set_pin("4567");
+		entry.set_note("sensitive note");
+		for id in [3, 4, 5] {
+			assert!(entry.field_atlas.get(id).is_none());
+		}
+		let cloned = entry.clone();
+		drop(entry);
+		assert_eq!(cloned.get_password().as_str(), "secret");
+		let restored = PasswordEntry::from(FieldAtlas::deserialize(&cloned.serialize()));
+		assert_eq!(restored.get_note().as_str(), "sensitive note");
+		assert_eq!(restored.get_pin().as_str(), "4567");
 	}
 }

@@ -1,15 +1,16 @@
 use crate::gui::messages::Message;
 use crate::{gui::colors, storage::entry::PasswordEntry};
 use iced::{
+	Alignment, Background, Center, Color, Element, Fill, Font,
 	advanced::text::highlighter::PlainText,
 	border, font,
 	theme::{Palette, Theme},
 	widget::{
-		button, center, column, container, mouse_area, row, space, text, text_editor, text_input,
-		tooltip, TextEditor, TextInput, Tooltip,
+		TextEditor, TextInput, button, center, column, container, mouse_area, row, space, text,
+		text_editor, text_input, tooltip,
 	},
-	Alignment, Background, Center, Color, Element, Fill, Font,
 };
+use zeroize::Zeroizing;
 
 const DEFAULT_BUTTON_SIZE: (u32, u32) = (120, 40);
 
@@ -101,7 +102,7 @@ pub fn unlock_screen<'a>(
 				.on_submit(Message::FocusNext),
 			styled_text_input("db_password...", db_password)
 				.secure(true)
-				.on_input(Message::DbPasswordChanged)
+				.on_input(|value| Message::DbPasswordChanged(Zeroizing::new(value)))
 				.on_submit(Message::AttemptUnlock),
 			center(styled_button(
 				if *is_processing {
@@ -124,18 +125,16 @@ pub fn unlock_screen<'a>(
 	column![title_bar(), unlock_panel].into()
 }
 
-fn styled_tooltip<'a, Message>(
+fn styled_tooltip<'a, Message: 'a>(
 	underlay: impl Into<Element<'a, Message>>,
 	label: &'a str,
-) -> Tooltip<'a, Message>
-where
-	Message: 'a,
-{
+) -> Element<'a, Message> {
 	tooltip(
 		underlay,
-		container(text(label.to_string()).color(colors::BRAND_GREEN).size(18)).padding(10),
+		container(text(label).color(colors::BRAND_GREEN).size(18)).padding(10),
 		tooltip::Position::Right,
 	)
+	.into()
 }
 
 pub fn password_screen<'a>(
@@ -143,6 +142,7 @@ pub fn password_screen<'a>(
 	password_entry: &PasswordEntry,
 	is_password_visible: &bool,
 	is_pin_visible: &bool,
+	is_note_visible: &bool,
 	note: &'a text_editor::Content,
 	status: &'a str,
 ) -> Element<'a, Message> {
@@ -150,42 +150,61 @@ pub fn password_screen<'a>(
 		styled_query_input("query...", query)
 			.on_input(Message::QueryInput)
 			.on_submit(Message::QuerySubmit),
-		"Query  ",
+		"Query    ",
 	);
-	let header = container(column![query_input]).padding(8).width(Fill);
+	let header = container(column![query_input]).padding([8, 4]).width(Fill);
 	let name_input = styled_tooltip(
 		styled_text_input("name", password_entry.get_name())
 			.on_input(Message::PasswordEntryNameInput)
 			.on_submit(Message::FocusNext),
-		"Name  ",
+		"Name    ",
 	);
-	let username_input = styled_tooltip(
-		styled_text_input("username", password_entry.get_username())
-			.on_input(Message::PasswordEntryUsernameInput)
-			.on_submit(Message::FocusNext),
-		"Username  ",
-	);
-	let password_input = styled_tooltip(
-		styled_text_input("password", password_entry.get_password())
-			.secure(!is_password_visible)
-			.on_input(Message::PasswordEntryPasswordInput)
-			.on_submit(Message::FocusNext),
-		"Password                    ",
-	);
+	let username_input = styled_text_input("username", password_entry.get_username())
+		.on_input(Message::PasswordEntryUsernameInput)
+		.on_submit(Message::FocusNext);
+	let password = if *is_password_visible {
+		password_entry.get_password()
+	} else {
+		Zeroizing::new(String::new())
+	};
+	let password_input = styled_text_input(
+		if *is_password_visible {
+			"password"
+		} else {
+			"Hidden — reveal to edit"
+		},
+		&password,
+	)
+	.on_input_maybe(
+		is_password_visible
+			.then_some(|value| Message::PasswordEntryPasswordInput(Zeroizing::new(value))),
+	)
+	.on_submit(Message::FocusNext);
 	let mini_button_size = (44, 44);
+	let username_copy_button = styled_button("📋", Message::CopyUsername, mini_button_size);
 	let password_copy_button = styled_button("📋", Message::CopyPassword, mini_button_size);
 	let password_visibility_toggle = styled_button(
 		if *is_password_visible { "👀" } else { "👁" },
 		Message::TogglePasswordVisibility,
 		mini_button_size,
 	);
-	let pin_input = styled_tooltip(
-		styled_text_input("pin", password_entry.get_pin())
-			.secure(!is_pin_visible)
-			.on_input(Message::PasswordEntryPinInput)
-			.on_submit(Message::FocusNext),
-		"Pin                    ",
-	);
+	let pin = if *is_pin_visible {
+		password_entry.get_pin()
+	} else {
+		Zeroizing::new(String::new())
+	};
+	let pin_input = styled_text_input(
+		if *is_pin_visible {
+			"pin"
+		} else {
+			"Hidden — reveal to edit"
+		},
+		&pin,
+	)
+	.on_input_maybe(
+		is_pin_visible.then_some(|value| Message::PasswordEntryPinInput(Zeroizing::new(value))),
+	)
+	.on_submit(Message::FocusNext);
 	let pin_copy_button = styled_button("📋", Message::CopyPin, mini_button_size);
 	let pin_visibility_toggle = styled_button(
 		if *is_pin_visible { "👀" } else { "👁" },
@@ -196,36 +215,65 @@ pub fn password_screen<'a>(
 		styled_text_input("url", password_entry.get_url())
 			.on_input(Message::PasswordEntryUrlInput)
 			.on_submit(Message::FocusNext),
-		"URL  ",
+		"URL    ",
 	);
 	let tags_input = styled_tooltip(
 		styled_text_input("tags", password_entry.get_tags())
 			.on_input(Message::PasswordEntryTagsInput)
 			.on_submit(Message::FocusNext),
-		"Tags  ",
+		"Tags    ",
 	);
-	let note_editor = styled_tooltip(
-		styled_text_editor("note".into(), note).on_action(Message::PasswordEntryNoteAction),
-		"Note  ",
+	// The hidden state contains empty Content, but occupies the same area as
+	// the revealed editor. Only the revealed editor accepts input.
+	let note_editor = styled_text_editor("note".into(), note).placeholder(if *is_note_visible {
+		"note"
+	} else {
+		"Note hidden — reveal to edit"
+	});
+	let note_editor = if *is_note_visible {
+		note_editor.on_action(Message::PasswordEntryNoteAction)
+	} else {
+		note_editor
+	};
+	let note_toggle = styled_button(
+		if *is_note_visible { "👀" } else { "👁" },
+		Message::ToggleNoteVisibility,
+		mini_button_size,
 	);
-	let main_content = container(center(
+	let note_row = styled_tooltip(
+		row![note_editor, note_toggle].height(Fill),
+		"Note            ",
+	);
+
+	let main_content = container(
 		column![
 			name_input,
-			username_input,
-			row![
-				password_input,
-				password_copy_button,
-				password_visibility_toggle
-			],
-			row![pin_input, pin_copy_button, pin_visibility_toggle],
+			styled_tooltip(
+				row![username_input, username_copy_button],
+				"Username            "
+			),
+			styled_tooltip(
+				row![
+					password_input,
+					password_copy_button,
+					password_visibility_toggle
+				],
+				"Password                    "
+			),
+			styled_tooltip(
+				row![pin_input, pin_copy_button, pin_visibility_toggle],
+				"PIN                    "
+			),
 			url_input,
 			tags_input,
-			note_editor,
+			note_row,
 		]
-		.spacing(4),
-	))
+		.spacing(4)
+		.height(Fill),
+	)
 	.padding(4)
-	.width(Fill);
+	.width(Fill)
+	.height(Fill);
 	let button_bar = row![
 		space::horizontal(),
 		styled_button("Get", Message::PasswordEntryGet, DEFAULT_BUTTON_SIZE),
