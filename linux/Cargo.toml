@@ -15,7 +15,8 @@ assets = [
     ["digisafe.png", "/usr/share/pixmaps/digisafe.png", "644"],
     ["digisafe.desktop", "/usr/share/applications/digisafe.desktop", "644"],
 ]
-depends = "argon2, systemd"
+depends = "argon2, systemd, libcap2-bin"
+maintainer-scripts = "debian"
 
 [dependencies]
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }

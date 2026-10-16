@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+case "$1" in
+    configure)
+        # mlockall must cover the GUI and the 4 GiB password derivation.
+        # File capabilities are lost when dpkg replaces the executable.
+        /usr/sbin/setcap cap_ipc_lock=ep /usr/bin/digisafe
+        ;;
+esac
+
+exit 0
