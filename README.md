@@ -79,9 +79,9 @@ and receiving applications can also retain copied secrets.
  - wayland-data-control.
 
 #### Screenshots:
-![ScreenShot](https://github.com/JoelBondurant/digisafe/blob/main/doc/img/unlock_screen.png)
+![ScreenShot](doc/img/unlock_screen.png)
 
-![ScreenShot](https://github.com/JoelBondurant/digisafe/blob/main/doc/img/empty_entry.png)
+![ScreenShot](doc/img/empty_entry.png)
 
-![ScreenShot](https://github.com/JoelBondurant/digisafe/blob/main/doc/img/sample_entry.png)
+![ScreenShot](doc/img/sample_entry.png)
 
